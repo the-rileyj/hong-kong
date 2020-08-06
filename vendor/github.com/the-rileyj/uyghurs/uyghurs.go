@@ -22,12 +22,7 @@ type UyghursSecrets struct {
 }
 
 type HongKongSettings struct {
-	HongKongImageSettings HongKongImageSettings `yaml:"x-hong-kong"`
-}
-
-type HongKongImageSettings struct {
-	Dockerfile string `yaml:"dockerfile"`
-	Route      string `yaml:"route"`
+	HongKongProjectSettings ProjectMetadata `yaml:"x-hong-kong"`
 }
 
 type GithubPush struct {
@@ -74,10 +69,29 @@ type WorkRequest struct {
 }
 
 type WorkResponse struct {
-	Err        string
-	GithubData GithubPush `json:"githubData"`
+	Err             string
+	GithubData      GithubPush      `json:"githubData"`
+	ProjectMetadata ProjectMetadata `json:"projectMetaData"`
 }
 
 type PingResponse struct {
 	State WorkerMessageType `json:"state"`
+}
+
+type ProjectMetadata struct {
+	ProjectName   string       `json:"projectName" yaml:"projectName"`
+	BuildsInfo    []*BuildInfo `json:"buildInfo" yaml:"buildInfo"`
+	ProjectRoutes []*RouteInfo `json:"projectRoutes" yaml:"projectRoutes"`
+}
+
+type BuildInfo struct {
+	Context    string `json:"context" yaml:"context"`
+	Dockerfile string `json:"dockerfile" yaml:"dockerfile"`
+	Name       string `json:"name" yaml:"name"`
+}
+
+type RouteInfo struct {
+	ForwardHost string `json:"forwardHost" yaml:"forwardHost"`
+	Route       string `json:"route" yaml:"route"`
+	Domain      string `json:"domain" yaml:"domain"`
 }

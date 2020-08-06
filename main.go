@@ -12,10 +12,13 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
+	"net"
 	"net/url"
 	"os"
 	"os/signal"
 	"path"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -25,22 +28,24 @@ import (
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/go-git/go-git/v5/storage/memory"
-	"github.com/gorilla/websocket"
+	"github.com/gobwas/ws"
+	"github.com/gobwas/ws/wsutil"
+	"github.com/joho/godotenv"
 	"github.com/mitchellh/mapstructure"
 	"github.com/the-rileyj/uyghurs"
 	"gopkg.in/yaml.v2"
 )
 
-func parseDockerComposeYML(dockerComposeBytes []byte) (uyghurs.HongKongImageSettings, error) {
+func parseDockerComposeYML(dockerComposeBytes []byte) (uyghurs.ProjectMetadata, error) {
 	var hongKongSettings uyghurs.HongKongSettings
 
 	err := yaml.Unmarshal(dockerComposeBytes, &hongKongSettings)
 
 	if err != nil {
-		return uyghurs.HongKongImageSettings{}, err
+		return uyghurs.ProjectMetadata{}, err
 	}
 
-	return hongKongSettings.HongKongImageSettings, nil
+	return hongKongSettings.HongKongProjectSettings, nil
 }
 
 // func tester(GitlabCIBytes []byte) (*GitlabCI, error) {
@@ -156,7 +161,7 @@ func EntryDirToTarHeader(n string) *tar.Header {
 	}
 }
 
-func buildImageForApp(cli *client.Client, githubRepo uyghurs.GithubPush) error {
+func buildImageForApp(cli *client.Client, githubRepo uyghurs.GithubPush) (*uyghurs.ProjectMetadata, error) {
 	memoryStorage := memory.NewStorage()
 
 	// authMethod, err := ssh.DefaultAuthBuilder(ssh.DefaultUsername)
@@ -180,19 +185,19 @@ func buildImageForApp(cli *client.Client, githubRepo uyghurs.GithubPush) error {
 	headCommitRef, err := r.Head()
 
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	headCommit, err := r.CommitObject(headCommitRef.Hash())
 
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	headTree, err := headCommit.Tree()
 
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// tar up repo for docker image building
@@ -201,7 +206,7 @@ func buildImageForApp(cli *client.Client, githubRepo uyghurs.GithubPush) error {
 
 	entryPaths := make([]string, 0)
 
-	var hongKongImageSettings uyghurs.HongKongImageSettings
+	var hongKongSettings uyghurs.ProjectMetadata
 
 	handleEntry := func(entry object.TreeEntry, entryName string) error {
 		if !entry.Mode.IsFile() {
@@ -238,7 +243,7 @@ func buildImageForApp(cli *client.Client, githubRepo uyghurs.GithubPush) error {
 					panic(err)
 				}
 
-				hongKongImageSettings, err = parseDockerComposeYML(dockerComposeBytes)
+				hongKongSettings, err = parseDockerComposeYML(dockerComposeBytes)
 
 				if err != nil {
 					return err
@@ -257,7 +262,7 @@ func buildImageForApp(cli *client.Client, githubRepo uyghurs.GithubPush) error {
 		err = handleEntry(entry, entry.Name)
 
 		if err != nil {
-			return err
+			return nil, err
 		}
 	}
 
@@ -265,7 +270,7 @@ func buildImageForApp(cli *client.Client, githubRepo uyghurs.GithubPush) error {
 		nextTree, err := headTree.Tree(entryPaths[0])
 
 		if err != nil {
-			return err
+			return nil, err
 		}
 
 		for _, entry := range nextTree.Entries {
@@ -274,101 +279,109 @@ func buildImageForApp(cli *client.Client, githubRepo uyghurs.GithubPush) error {
 			err = handleEntry(entry, nextPathName)
 
 			if err != nil {
-				return err
+				return nil, err
 			}
 		}
 
 		entryPaths = append([]string{}, entryPaths[1:]...)
 	}
 
-	if hongKongImageSettings.Dockerfile == "" {
-		return errors.New("hong kong image settings missing dockerfile")
-	}
-
 	// write end header
 	tarWriter.Close()
 
-	cancelCtx, cancelCancelCtx := context.WithCancel(context.Background())
+	for _, hongKongBuildSetting := range hongKongSettings.BuildsInfo {
+		if hongKongBuildSetting.Dockerfile == "" {
+			return nil, errors.New("hong kong image settings missing dockerfile")
+		}
 
-	defer cancelCancelCtx()
+		cancelCtx, cancelCancelCtx := context.WithCancel(context.Background())
 
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+		buildOptions := types.ImageBuildOptions{
+			Tags: []string{
+				fmt.Sprintf("docker.io/therileyjohnson/%s_%s:latest", githubRepo.Repository.Name, hongKongBuildSetting.Name),
+				fmt.Sprintf("docker.io/therileyjohnson/%s_%s:%s", githubRepo.Repository.Name, hongKongBuildSetting.Name, githubRepo.After),
+			},
+			Dockerfile: hongKongBuildSetting.Dockerfile,
+			// Squash:     true, // NEED EXPERIMENTAL MODE APPARENTLY
+		}
 
-	go func() {
-		select {
-		case <-c:
+		fmt.Println("ABOUT TO BUILD...")
+
+		response, err := cli.ImageBuild(cancelCtx, &tarBuffer, buildOptions)
+
+		if err != nil {
 			cancelCancelCtx()
 
-			<-cancelCtx.Done()
+			return nil, err
 		}
-	}()
 
-	buildOptions := types.ImageBuildOptions{
-		Tags: []string{
-			fmt.Sprintf("docker.io/therileyjohnson/%s:latest", githubRepo.Repository.Name),
-			fmt.Sprintf("docker.io/therileyjohnson/%s:%s", githubRepo.Repository.Name, githubRepo.After),
-		},
-		Dockerfile: hongKongImageSettings.Dockerfile,
-		// Squash:     true, // NEED EXPERIMENTAL MODE APPARENTLY
+		fmt.Println("READING BUILD RESPONSE...")
+
+		rb, err := ioutil.ReadAll(response.Body)
+
+		fmt.Println("DONE READING BUILD RESPONSE...", string(rb))
+
+		if err != nil {
+			cancelCancelCtx()
+
+			fmt.Println(string(rb))
+
+			return nil, err
+		}
+
+		cancelCancelCtx()
 	}
 
-	response, err := cli.ImageBuild(cancelCtx, &tarBuffer, buildOptions)
-
-	if err != nil {
-		return err
-	}
-
-	rb, err := ioutil.ReadAll(response.Body)
-
-	if err != nil {
-		return err
-	}
-
-	fmt.Println(string(rb))
-
-	return nil
+	return &hongKongSettings, nil
 }
 
 func main() {
+	uyghursHost := flag.String("host", "therileyjohnson.com:8443", "http service address")
+
+	development := flag.Bool("d", false, "development flag")
+	envFile := flag.Bool("f", false, "use env file for config")
+
+	flag.Parse()
+
+	if *envFile {
+		err := godotenv.Load()
+
+		if err != nil {
+			log.Fatal("Error loading .env file")
+		}
+	}
+
 	envVars := make(map[string]string)
 
-	for _, envVarKey := range []string{"DOCKER_USERNAME", "DOCKER_PASSWORD", "UYGHURS_KEY"} {
+	for _, envVarKey := range []string{"DOCKERHUB_USERNAME", "DOCKERHUB_PASSWORD", "UYGHURS_PATH", "UYGHURS_KEY"} {
 		envVarValue := os.Getenv(envVarKey)
 
 		if envVarValue == "" {
 			log.Fatalf(`environmental variable "%s" is not set`, envVarKey)
 		}
 
-		envVars[envVarKey] = envVarValue
+		envVars[envVarKey] = strings.Trim(envVarValue, "\r\n")
 	}
 
-	dockerUsername := envVars["DOCKER_USERNAME"]
-	dockerPassword := envVars["DOCKER_PASSWORD"]
+	dockerUsername := envVars["DOCKERHUB_USERNAME"]
+	dockerPassword := envVars["DOCKERHUB_PASSWORD"]
 
+	uyghursPath := envVars["UYGHURS_PATH"]
 	uyghursKey := envVars["UYGHURS_KEY"]
 
 	cli, err := client.NewEnvClient()
 
 	if err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
-
-	uyghursHost := flag.String("host", "localhost", "http service address")
-
-	development := flag.Bool("d", false, "development flag")
-
-	flag.Parse()
-
-	uyghursHostname := fmt.Sprintf("%s:9969", *uyghursHost)
 
 	uyghursScheme := "ws"
 
-	if *development {
+	if !*development {
 		uyghursScheme = "wss"
 	}
 
-	log.Printf("~> Starting Hong-Kong Client, connection to %s://%s/worker/UYGHURS_KEY \n", uyghursScheme, uyghursHostname)
+	log.Printf("~> Starting Hong-Kong Client, connection to %s://%s%s/UYGHURS_KEY \n", uyghursScheme, *uyghursHost, uyghursPath)
 
 	interruptChan := make(chan os.Signal, 1)
 
@@ -380,42 +393,136 @@ func main() {
 		log.Fatalln("Killed by signal")
 	}()
 
-	uyghursURL := url.URL{Scheme: uyghursScheme, Host: uyghursHostname, Path: fmt.Sprintf("/worker/%s", uyghursKey)}
+	uyghursURL := url.URL{Scheme: uyghursScheme, Host: *uyghursHost, Path: fmt.Sprintf("%s/%s", uyghursPath, uyghursKey)}
 
-	uyghursConnection, _, err := websocket.DefaultDialer.Dial(uyghursURL.String(), nil)
+	// uyghursConnection, _, err := websocket.DefaultDialer.Dial(uyghursURL.String(), nil)
 
-	if err != nil {
-		log.Fatal("dial to uyghurs failed!")
+	// if err != nil {
+	// 	log.Fatal("initial dial to uyghurs failed!")
+	// } else {
+	// 	defer uyghursConnection.Close()
+
+	// 	log.Println("Connected to uyghurs server!")
+	// }
+
+	// reconnectIndefinitely := func() {
+	// 	var reconnectErr error
+
+	// 	for reconnectErr != nil {
+	// 		if uyghursConnection != nil {
+	// 			uyghursConnection.Close()
+	// 		}
+
+	// 		uyghursConnection, _, reconnectErr = websocket.DefaultDialer.Dial(uyghursURL.String(), nil)
+
+	// 		log.Println("Reconnected to uyghurs server!")
+
+	// 		time.Sleep(5 * time.Second)
+	// 	}
+	// }
+
+	connectIndefinitely := func() net.Conn {
+		var (
+			conn    net.Conn
+			connErr error
+		)
+
+		dialCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+
+		for conn, _, _, connErr = ws.DefaultDialer.Dial(dialCtx, uyghursURL.String()); connErr != nil; {
+			time.Sleep(time.Second)
+
+			cancel()
+
+			dialCtx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+
+			conn, _, _, connErr = ws.DefaultDialer.Dial(dialCtx, uyghursURL.String())
+		}
+
+		cancel()
+
+		return conn
 	}
 
-	defer uyghursConnection.Close()
+	uyghursConnection := connectIndefinitely()
 
-	log.Println("Connected to uyghurs server!")
+	log.Println("Initial connection to uyghurs")
 
 	var workerMessage uyghurs.WorkerMessage
 
-	for {
-		_, messageBytes, err := uyghursConnection.ReadMessage()
+	receiveMessageChan := make(chan []byte)
+	sendMessageChan := make(chan []byte)
 
-		if websocket.IsCloseError(err, websocket.CloseNoStatusReceived, websocket.CloseAbnormalClosure, websocket.CloseInternalServerErr) {
-			for err != nil {
-				time.Sleep(5 * time.Second)
+	connectionLock := &sync.Mutex{}
 
-				uyghursConnection.Close()
+	go func() {
+		for {
+			receiveMessageBytes, _, err := wsutil.ReadServerData(uyghursConnection)
 
-				uyghursConnection, _, err = websocket.DefaultDialer.Dial(uyghursURL.String(), nil)
+			if err != nil {
+				connectionLock.Lock()
 
-				defer uyghursConnection.Close()
+				if uyghursConnection != nil {
+					uyghursConnection.Close()
+				}
+
+				uyghursConnection = connectIndefinitely()
+
+				log.Println("Reconnected to uyghurs server!")
+
+				connectionLock.Unlock()
+
+				continue
 			}
 
-			log.Println("Reconnected to uyghurs server!")
-
-			continue
-		} else if websocket.IsCloseError(err, websocket.CloseNoStatusReceived, websocket.CloseGoingAway, websocket.CloseMessage, websocket.CloseNormalClosure) {
-			log.Fatalln("Disconnected from uyghurs server,", err)
-		} else {
-			log.Fatalln("Disconnected from uyghurs server, unknown err,", err)
+			if len(receiveMessageBytes) != 0 {
+				receiveMessageChan <- receiveMessageBytes
+			}
 		}
+	}()
+
+	go func() {
+		var (
+			messageSent      bool
+			sendMessageBytes []byte
+		)
+
+		for sendMessageBytes = range sendMessageChan {
+			messageSent = false
+
+			for !messageSent {
+				connectionLock.Lock()
+
+				err = wsutil.WriteClientMessage(uyghursConnection, ws.OpText, sendMessageBytes)
+
+				connectionLock.Unlock()
+
+				if err != nil {
+					log.Println("error sending work response JSON")
+
+					continue
+				}
+
+				messageSent = true
+			}
+
+		}
+	}()
+
+	for messageBytes := range receiveMessageChan {
+		// _, messageBytes, err := uyghursConnection.ReadMessage()
+
+		// if err != nil {
+		// 	if websocket.IsCloseError(err, websocket.CloseNoStatusReceived, websocket.CloseAbnormalClosure, websocket.CloseInternalServerErr) {
+		// 		reconnectIndefinitely()
+
+		// 		continue
+		// 	} else if websocket.IsCloseError(err, websocket.CloseNoStatusReceived, websocket.CloseGoingAway, websocket.CloseMessage, websocket.CloseNormalClosure) {
+		// 		log.Fatalln("Disconnected from uyghurs server,", err)
+		// 	} else {
+		// 		log.Fatalln("Disconnected from uyghurs server, unknown err,", err)
+		// 	}
+		// }
 
 		err = json.Unmarshal(messageBytes, &workerMessage)
 
@@ -434,14 +541,28 @@ func main() {
 			sendResponse := func(sendErr error) {
 				fmt.Println("error occured:", sendErr)
 
-				err := websocket.WriteJSON(uyghursConnection, uyghurs.WorkerMessage{
-					Type:        int(uyghurs.WorkResponseType),
-					MessageData: structs.Map(uyghurs.WorkResponse{sendErr.Error(), messageData.GithubData}),
+				sendResponseBytes, err := json.Marshal(uyghurs.WorkerMessage{
+					Type: int(uyghurs.WorkResponseType),
+					MessageData: structs.Map(uyghurs.WorkResponse{
+						Err:             sendErr.Error(),
+						GithubData:      messageData.GithubData,
+						ProjectMetadata: uyghurs.ProjectMetadata{},
+					}),
 				})
 
 				if err != nil {
-					log.Println("error sending work response JSON:", err)
+					log.Println("error marshalling response JSON:", err)
+
+					return
 				}
+
+				sendMessageChan <- sendResponseBytes
+
+				// err = wsutil.WriteClientMessage(uyghursConnection, ws.OpText, sendResponseBytes)
+
+				// if err != nil {
+				// 	log.Println("error sending work response JSON:", err)
+				// }
 			}
 
 			if err != nil {
@@ -452,9 +573,9 @@ func main() {
 
 			fmt.Println("Received WorkRequest")
 
-			fmt.Println(messageData)
+			// fmt.Println(messageData)
 
-			err = buildImageForApp(cli, messageData.GithubData)
+			hongKongSettings, err := buildImageForApp(cli, messageData.GithubData)
 
 			if err != nil {
 				sendResponse(fmt.Errorf("error building image: %s", err.Error()))
@@ -462,76 +583,101 @@ func main() {
 				continue
 			}
 
-			log.Printf("Image built for %s\n", messageData.GithubData.Repository.Name)
+			hongKongSettings.ProjectName = messageData.GithubData.Repository.Name
 
-			timeoutContext, cancel := context.WithTimeout(context.Background(), time.Minute)
-
-			type pushResponse struct {
-				err error
-			}
-
-			responseChan := make(chan pushResponse)
-
-			authConfig := types.AuthConfig{
-				Username: dockerUsername,
-				Password: dockerPassword,
-			}
-
-			encodedJSON, err := json.Marshal(authConfig)
-
-			if err != nil {
-				panic(err)
-			}
-
-			go func() {
-				response, err := cli.ImagePush(
-					timeoutContext,
-					fmt.Sprintf("docker.io/therileyjohnson/%s:latest", messageData.GithubData.Repository.Name),
-					types.ImagePushOptions{
-						All:          true,
-						RegistryAuth: base64.URLEncoding.EncodeToString(encodedJSON),
-					},
-				)
-
-				if response != nil {
-					// Need to wait for response to close for image to fully push
-					io.Copy(ioutil.Discard, response)
-
-					response.Close()
-				}
-
-				responseChan <- pushResponse{err}
-			}()
+			log.Printf("Image(s) built for %s\n", messageData.GithubData.Repository.Name)
 
 			var pushErr error
 
-			select {
-			case <-timeoutContext.Done():
-				pushErr = timeoutContext.Err()
+			for _, hongKongBuildSetting := range hongKongSettings.BuildsInfo {
+				timeoutContext, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+
+				type pushResponse struct {
+					err error
+				}
+
+				responseChan := make(chan pushResponse)
+
+				authConfig := types.AuthConfig{
+					Username: dockerUsername,
+					Password: dockerPassword,
+				}
+
+				encodedJSON, err := json.Marshal(authConfig)
+
+				if err != nil {
+					cancel()
+
+					panic(err)
+				}
+
+				go func() {
+					response, err := cli.ImagePush(
+						timeoutContext,
+						fmt.Sprintf("docker.io/therileyjohnson/%s_%s:latest", messageData.GithubData.Repository.Name, hongKongBuildSetting.Name),
+						types.ImagePushOptions{
+							All:          true,
+							RegistryAuth: base64.URLEncoding.EncodeToString(encodedJSON),
+						},
+					)
+
+					if response != nil {
+						// Need to wait for response to close for image to fully push
+						io.Copy(os.Stdout, response)
+
+						response.Close()
+					}
+
+					responseChan <- pushResponse{err}
+				}()
+
+				select {
+				case <-timeoutContext.Done():
+					pushErr = timeoutContext.Err()
+
+					if pushErr != nil {
+						log.Printf("pushing image timed out for %s\n", messageData.GithubData.Repository.Name)
+					}
+				case responseInfo := <-responseChan:
+					pushErr = responseInfo.err
+				}
+
+				cancel()
 
 				if pushErr != nil {
-					log.Printf("pushing image timed out for %s\n", messageData.GithubData.Repository.Name)
+					sendResponse(pushErr)
+
+					break
 				}
-			case responseInfo := <-responseChan:
-				pushErr = responseInfo.err
 			}
 
-			cancel()
-
 			if pushErr != nil {
-				sendResponse(pushErr)
-
 				continue
 			}
 
-			err = websocket.WriteJSON(uyghursConnection, uyghurs.WorkerMessage{
+			// err = websocket.WriteJSON(uyghursConnection, uyghurs.WorkerMessage{
+			// 	Type:        int(uyghurs.WorkResponseType),
+			// 	MessageData: structs.Map(uyghurs.WorkResponse{"", messageData.GithubData, *hongKongSettings}),
+			// })
+
+			workResponseBytes, err := json.Marshal(uyghurs.WorkerMessage{
 				Type:        int(uyghurs.WorkResponseType),
-				MessageData: structs.Map(uyghurs.WorkResponse{"", messageData.GithubData}),
+				MessageData: structs.Map(uyghurs.WorkResponse{"", messageData.GithubData, *hongKongSettings}),
 			})
 
 			if err != nil {
-				log.Printf("error sending work response JSON for %s: %s\n", messageData.GithubData.Repository.Name, err)
+				log.Println("error marshalling work response JSON:", err)
+
+				return
 			}
+
+			sendMessageChan <- workResponseBytes
+
+			// err = wsutil.WriteClientMessage(uyghursConnection, ws.OpText, workResponseBytes)
+
+			// if err != nil {
+			// 	log.Printf("error sending work response JSON for %s: %s\n", messageData.GithubData.Repository.Name, err)
+			// }
 
 			log.Printf("pushed image successfully for %s\n", messageData.GithubData.Repository.Name)
 		case uyghurs.PingRequestType:
