@@ -161,6 +161,75 @@ func EntryDirToTarHeader(n string) *tar.Header {
 	}
 }
 
+func getBuildContext(buildContextDir string, headTree *object.Tree) (*bytes.Buffer, error) {
+	tarBuffer := bytes.Buffer{}
+	tarWriter := tar.NewWriter(&tarBuffer)
+
+	entryPaths := make([]string, 0)
+
+	handleEntry := func(entry object.TreeEntry, entryName string) error {
+		if !entry.Mode.IsFile() {
+			entryFileHeader := EntryDirToTarHeader(strings.TrimPrefix(entry.Name, buildContextDir))
+
+			if err := tarWriter.WriteHeader(entryFileHeader); err != nil {
+				return err
+			}
+
+			entryPaths = append(entryPaths, entryName)
+		} else {
+			entryFile, err := headTree.File(entryName)
+
+			if err != nil {
+				return err
+			}
+
+			entryFile.Name = strings.TrimPrefix(entryFile.Name, buildContextDir)
+
+			entryFileHeader := ObjectFileToTarHeader(entryFile)
+
+			if err := tarWriter.WriteHeader(entryFileHeader); err != nil {
+				return err
+			}
+
+			entryFileReader, err := entryFile.Reader()
+
+			if err != nil {
+				return err
+			}
+
+			io.Copy(tarWriter, entryFileReader)
+		}
+
+		return nil
+	}
+
+	entryPaths = append(entryPaths, buildContextDir)
+
+	for len(entryPaths) != 0 {
+		nextTree, err := headTree.Tree(entryPaths[0])
+
+		if err != nil {
+			return nil, err
+		}
+
+		for _, entry := range nextTree.Entries {
+			nextPathName := path.Join(entryPaths[0], entry.Name)
+
+			err = handleEntry(entry, nextPathName)
+
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		entryPaths = append([]string{}, entryPaths[1:]...)
+	}
+
+	tarWriter.Close()
+
+	return &tarBuffer, nil
+}
+
 func buildImageForApp(cli *client.Client, githubRepo uyghurs.GithubPush) (*uyghurs.ProjectMetadata, error) {
 	memoryStorage := memory.NewStorage()
 
@@ -291,8 +360,17 @@ func buildImageForApp(cli *client.Client, githubRepo uyghurs.GithubPush) (*uyghu
 
 	for _, hongKongBuildSetting := range hongKongSettings.BuildsInfo {
 		if hongKongBuildSetting.Dockerfile == "" {
-			return nil, errors.New("hong kong image settings missing dockerfile")
+			if hongKongBuildSetting.Context == "" {
+				return nil, errors.New("hong kong image settings missing dockerfile")
+			}
+
+			hongKongBuildSetting.Dockerfile = path.Join(hongKongBuildSetting.Context, "dockerfile")
+		} else if hongKongBuildSetting.Context != "" && strings.HasPrefix(hongKongBuildSetting.Dockerfile, hongKongBuildSetting.Context) {
+			// Trim build context path if included in dockerfile path
+			hongKongBuildSetting.Dockerfile = strings.TrimPrefix(hongKongBuildSetting.Dockerfile, hongKongBuildSetting.Context)
 		}
+
+		hongKongBuildSetting.Dockerfile = strings.TrimPrefix(hongKongBuildSetting.Dockerfile, "/")
 
 		cancelCtx, cancelCancelCtx := context.WithCancel(context.Background())
 
@@ -307,7 +385,21 @@ func buildImageForApp(cli *client.Client, githubRepo uyghurs.GithubPush) (*uyghu
 
 		fmt.Println("ABOUT TO BUILD...")
 
-		response, err := cli.ImageBuild(cancelCtx, &tarBuffer, buildOptions)
+		buildContextBuffer := &tarBuffer
+
+		if hongKongBuildSetting.Context != "" {
+			fmt.Println("BUILD CONTEXT:", hongKongBuildSetting.Context)
+
+			buildContextBuffer, err = getBuildContext(hongKongBuildSetting.Context, headTree)
+
+			if err != nil {
+				cancelCancelCtx()
+
+				return nil, err
+			}
+		}
+
+		response, err := cli.ImageBuild(cancelCtx, buildContextBuffer, buildOptions)
 
 		if err != nil {
 			cancelCancelCtx()
@@ -319,7 +411,7 @@ func buildImageForApp(cli *client.Client, githubRepo uyghurs.GithubPush) (*uyghu
 
 		rb, err := ioutil.ReadAll(response.Body)
 
-		fmt.Println("DONE READING BUILD RESPONSE...", string(rb))
+		fmt.Println("DONE READING BUILD RESPONSE...")
 
 		if err != nil {
 			cancelCancelCtx()
